@@ -96,8 +96,8 @@ def response_metadata(data, requested_model, expected_reasoning=None, expected_t
     if requested_model == LUNA and data.get("model") != requested_model:
         reason = "Returned model differs from exact requested Luna"
     elif requested_model == LUNA and (expected_reasoning is None or expected_tier != "default"
-            or data.get("reasoning", {}).get("effort") != expected_reasoning.get("effort")
-            or data.get("reasoning", {}).get("mode") != expected_reasoning.get("mode")
+            or returned_reasoning.get("effort") != expected_reasoning.get("effort")
+            or returned_reasoning.get("mode") != expected_reasoning.get("mode")
             or data.get("service_tier") != expected_tier):
         reason = "Effective reasoning effort/mode/tier absent or differs from request"
     elif data.get("status") != "completed":

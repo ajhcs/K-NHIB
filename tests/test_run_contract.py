@@ -102,7 +102,7 @@ class EffectiveTreatment(unittest.TestCase):
         base = {"model":"gpt-6-luna", "status":"completed", "id":"synthetic",
                 "reasoning":{"effort":"medium","mode":"standard"}, "service_tier":"default",
                 "usage":{"input_tokens":10,"output_tokens":20}}
-        for delta in ({"reasoning":{}}, {"reasoning":{"effort":"max","mode":"standard"}},
+        for delta in ({"reasoning":None}, {"reasoning":{}}, {"reasoning":{"effort":"max","mode":"standard"}},
                       {"service_tier":None}, {"service_tier":"flex"}):
             with self.assertRaises(contract.ResponseContractError) as caught:
                 metadata(dict(base, **delta), "gpt-6-luna")
