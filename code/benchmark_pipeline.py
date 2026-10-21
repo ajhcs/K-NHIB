@@ -559,7 +559,7 @@ def call_openai_responses_api(payload: dict, max_input_tokens: int | None = None
     data = response.json()
     usage = data.get("usage", {})
 
-    metadata = response_metadata(data, payload["model"])
+    metadata = response_metadata(data, payload["model"], payload.get("reasoning"), payload.get("service_tier"))
     if payload["model"] == "gpt-6-luna" and metadata["usage_status"] == "known":
         if metadata["input_tokens"] > max_input_tokens or metadata["output_tokens"] > payload["max_output_tokens"]:
             raise ValueError("Provider usage exceeded admitted token caps")

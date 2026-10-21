@@ -51,6 +51,8 @@ def build_request(*, model, instructions, user_prompt, condition, config,
                "max_output_tokens": config.max_output_tokens}
     if model == LUNA:
         payload["reasoning"] = {"effort": config.effort, "mode": config.mode}
+        payload["service_tier"] = "default"
+        payload["store"] = False
     if condition in {"websearch", "pdf_websearch", "text_md_websearch"}:
         payload["tools"] = [{"type": "web_search"}]
     return payload
@@ -76,7 +78,7 @@ class ResponseContractError(ValueError):
         self.metadata = metadata
 
 
-def response_metadata(data, requested_model):
+def response_metadata(data, requested_model, expected_reasoning=None, expected_tier=None):
     """Preserve billed telemetry before classifying failed/incomplete responses."""
     usage = data.get("usage")
     usage = usage if isinstance(usage, dict) else {}
@@ -88,10 +90,16 @@ def response_metadata(data, requested_model):
                 "output_tokens": values[1] if known else None,
                 "usage_status": "known" if known else "unknown", "usage_details": usage,
                 "incomplete_details": data.get("incomplete_details"),
-                "response_receipt": data}
+                "response_receipt": data, "effective_reasoning":data.get("reasoning"),
+                "effective_service_tier":data.get("service_tier")}
     reason = None
     if requested_model == LUNA and data.get("model") != requested_model:
         reason = "Returned model differs from exact requested Luna"
+    elif requested_model == LUNA and (expected_reasoning is None or expected_tier != "default"
+            or data.get("reasoning", {}).get("effort") != expected_reasoning.get("effort")
+            or data.get("reasoning", {}).get("mode") != expected_reasoning.get("mode")
+            or data.get("service_tier") != expected_tier):
+        reason = "Effective reasoning effort/mode/tier absent or differs from request"
     elif data.get("status") != "completed":
         reason = "Responses request did not complete"
     elif any(c.get("type") == "refusal" for item in data.get("output", [])

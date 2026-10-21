@@ -10,6 +10,10 @@ sys.modules[SPEC.name] = contract
 SPEC.loader.exec_module(contract)
 
 
+def metadata(data, model):
+    return contract.response_metadata(data, model, {"effort":"medium", "mode":"standard"}, "default")
+
+
 class RequestContracts(unittest.TestCase):
     def request(self, **overrides):
         kwargs = dict(model="gpt-6-luna", instructions="Invented test only",
@@ -49,7 +53,7 @@ class RequestContracts(unittest.TestCase):
         self.assertNotIn("expected", str(p))
 
     def test_usage_unknown_is_not_zero(self):
-        m = contract.response_metadata({"model":"gpt-6-luna", "status":"completed"}, "gpt-6-luna")
+        m = metadata({"model":"gpt-6-luna", "status":"completed", "reasoning":{"effort":"medium","mode":"standard"}, "service_tier":"default"}, "gpt-6-luna")
         self.assertIsNone(m["input_tokens"])
         self.assertEqual(m["usage_status"], "unknown")
 
@@ -57,7 +61,7 @@ class RequestContracts(unittest.TestCase):
         for response in ({"model":"gpt-5.4", "status":"completed"},
                          {"model":"gpt-6-luna", "status":"incomplete"}):
             with self.assertRaises(ValueError):
-                contract.response_metadata(response, "gpt-6-luna")
+                metadata(response, "gpt-6-luna")
 
     def test_episode_replication_and_effort_identity(self):
         kw = dict(case_id="SYNTHETIC-1", model="gpt-6-luna", condition="text_md", run_id=0,
@@ -77,9 +81,9 @@ class RequestContracts(unittest.TestCase):
 class FailureAndCoverageContracts(unittest.TestCase):
     def test_incomplete_and_refusal_keep_billed_usage(self):
         for extra in ({"status":"incomplete"}, {"status":"completed", "output":[{"content":[{"type":"refusal"}]}]}):
-            data = dict(model="gpt-6-luna", id="synthetic-response", usage={"input_tokens":10,"output_tokens":20}, **extra)
+            data = dict(model="gpt-6-luna", id="synthetic-response", reasoning={"effort":"medium","mode":"standard"}, service_tier="default", usage={"input_tokens":10,"output_tokens":20}, **extra)
             with self.assertRaises(contract.ResponseContractError) as caught:
-                contract.response_metadata(data, "gpt-6-luna")
+                metadata(data, "gpt-6-luna")
             self.assertEqual(caught.exception.metadata["output_tokens"], 20)
             self.assertEqual(caught.exception.metadata["response_id"], "synthetic-response")
 
@@ -91,6 +95,19 @@ class FailureAndCoverageContracts(unittest.TestCase):
         self.assertEqual(len(reconciled), 1)
         self.assertEqual(reconciled[0]["predicted"], "missing")
         self.assertFalse(reconciled[0]["correct"])
+
+
+class EffectiveTreatment(unittest.TestCase):
+    def test_missing_or_mismatched_treatment_retains_usage_but_rejects_score(self):
+        base = {"model":"gpt-6-luna", "status":"completed", "id":"synthetic",
+                "reasoning":{"effort":"medium","mode":"standard"}, "service_tier":"default",
+                "usage":{"input_tokens":10,"output_tokens":20}}
+        for delta in ({"reasoning":{}}, {"reasoning":{"effort":"max","mode":"standard"}},
+                      {"service_tier":None}, {"service_tier":"flex"}):
+            with self.assertRaises(contract.ResponseContractError) as caught:
+                metadata(dict(base, **delta), "gpt-6-luna")
+            self.assertEqual(caught.exception.metadata["output_tokens"], 20)
+            self.assertEqual(caught.exception.metadata["response_id"], "synthetic")
 
 
 if __name__ == "__main__":
