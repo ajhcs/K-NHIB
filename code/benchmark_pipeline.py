@@ -17,6 +17,10 @@ import csv
 import base64
 import random
 import unicodedata
+import hashlib
+import uuid
+from run_contract import (ReasoningConfig, build_request, episode_id,
+                          request_hash, response_metadata, selected_ids)
 from datetime import datetime
 from pathlib import Path
 
@@ -38,7 +42,7 @@ ASSETS_DIR = DATA_DIR / "guidelines"                  # find_asset() searches gu
 
 def load_local_env() -> None:
     """Simple .env loader. Does not overwrite existing environment variables."""
-    for candidate in (BASE_DIR / ".env", BASE_DIR / ".env.local"):
+    for candidate in (REPO_DIR / ".env", REPO_DIR / ".env.local", BASE_DIR / ".env", BASE_DIR / ".env.local"):
         if not candidate.exists():
             continue
         for raw_line in candidate.read_text().splitlines():
@@ -60,15 +64,20 @@ def find_asset(filename: str = "", *, contains: str = "", suffix: str = "") -> P
     normalized_filename = _normalize_text(filename)
     normalized_contains = _normalize_text(contains)
 
-    for path in ASSETS_DIR.iterdir():
+    matches = []
+    for path in sorted(ASSETS_DIR.iterdir()):
         normalized_name = _normalize_text(path.name)
         if filename and normalized_name == normalized_filename:
-            return path
-        if contains and normalized_contains in normalized_name and (
+            matches.append(path)
+        elif contains and normalized_contains in normalized_name and (
             not suffix or normalized_name.endswith(suffix)
         ):
-            return path
+            matches.append(path)
 
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise ValueError("Ambiguous guideline asset")
     target = filename or contains
     raise FileNotFoundError(f"Asset not found: {target}")
 
@@ -91,7 +100,6 @@ FORWARD_SHEET_MAP = {
     "ovarian": "난소암",
 }
 # API keys (managed via environment variables)
-load_local_env()
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 OPENAI_API_KEY    = os.environ.get("OPENAI_API_KEY", "")
 GEMINI_API_KEY    = os.environ.get("GEMINI_API_KEY", "")
@@ -103,6 +111,7 @@ SUPPORTED_MODEL_CODES = {
         "claude-sonnet-4-6",
     ],
     "gpt": [
+        "gpt-6-luna",
         "gpt-5.4",
         "gpt-5-mini-2025-08-07",
     ],
@@ -135,7 +144,7 @@ SUPPORTED_MODEL_NAMES = list(MODEL_ALIASES.keys()) + [
 ]
 
 OUTPUT_DIR = REPO_DIR / "results"
-OUTPUT_DIR.mkdir(exist_ok=True)
+
 
 API_MAX_RETRIES = max(0, int(os.environ.get("API_MAX_RETRIES", "2")))
 API_RETRY_BASE_SECONDS = float(os.environ.get("API_RETRY_BASE_SECONDS", "1.0"))
@@ -144,8 +153,11 @@ API_RETRY_JITTER_SECONDS = float(os.environ.get("API_RETRY_JITTER_SECONDS", "0.2
 RETRYABLE_STATUS_CODES = {408, 409, 429, 500, 502, 503, 504}
 GEMINI_HTTP_TIMEOUT_MS = int(os.environ.get("GEMINI_HTTP_TIMEOUT_MS", "300000"))
 GENERATION_SETTINGS_POLICY = "provider_defaults"
-RESULT_KEY_COLUMNS = ["id", "model", "condition"]
+RESULT_KEY_COLUMNS = ["episode_id", "attempt_id"]
 RESULT_COLUMNS = [
+    "episode_id", "attempt_id", "experiment_id", "input_hash",
+    "reasoning_effort", "reasoning_mode", "is_dry_run",
+    "response_id", "response_status", "usage_status", "usage_details",
     "id",
     "cancer_type",
     "class",
@@ -220,7 +232,8 @@ def build_retry_task_plan(
     models: list[str],
     conditions: list[str],
 ) -> pd.DataFrame:
-    required_columns = {"id", "model", "condition", "predicted"}
+    required_columns = {"id", "model", "condition", "predicted", "run_id",
+                        "episode_id", "reasoning_effort", "reasoning_mode", "experiment_id", "input_hash"}
     missing_columns = required_columns - set(previous_results.columns)
     if missing_columns:
         raise ValueError(
@@ -228,15 +241,22 @@ def build_retry_task_plan(
             + ", ".join(sorted(missing_columns))
         )
 
-    failed = previous_results[previous_results["predicted"].astype(str) == "error"].copy()
+    latest = previous_results.sort_values("timestamp", kind="stable").drop_duplicates(subset=["episode_id"], keep="last")
+    failed = latest[latest["predicted"].astype(str) == "error"].copy()
     failed = failed[failed["model"].isin(models) & failed["condition"].isin(conditions)]
-    failed = failed[RESULT_KEY_COLUMNS].drop_duplicates(subset=RESULT_KEY_COLUMNS)
+    failed = failed.drop_duplicates(subset=["episode_id"])
 
     benchmark_rows = benchmark_df.copy()
     benchmark_rows["id"] = benchmark_rows["ID"]
-    task_plan = failed.merge(benchmark_rows, on="id", how="inner")
+    if set(failed["id"]) - set(benchmark_rows["id"]):
+        raise ValueError("Retry contains IDs outside the selected fixture set")
+    task_plan = failed.merge(benchmark_rows, on="id", how="inner", suffixes=("", "_fixture"))
+    for name in benchmark_rows.columns:
+        if name + "_fixture" in task_plan:
+            task_plan[name] = task_plan[name + "_fixture"]
     task_plan["__model"] = task_plan["model"]
     task_plan["__condition"] = task_plan["condition"]
+    task_plan["__run_id"] = task_plan["run_id"]
     return task_plan
 
 
@@ -501,11 +521,22 @@ def extract_anthropic_text(content_blocks) -> str:
     return "\n".join(texts).strip()
 
 
-def call_openai_responses_api(payload: dict) -> dict:
+def call_openai_responses_api(payload: dict, max_input_tokens: int | None = None) -> dict:
     require_api_key("OPENAI", OPENAI_API_KEY)
 
     try:
-        with httpx.Client(timeout=120.0) as client:
+        with httpx.Client(timeout=120.0, trust_env=False, follow_redirects=False) as client:
+            if payload["model"] == "gpt-6-luna":
+                if max_input_tokens is None or "tools" in payload:
+                    raise ValueError("Bounded Luna requires an input cap and no tools")
+                count = client.post(
+                    "https://api.openai.com/v1/responses/input_tokens",
+                    headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+                    json={k: payload[k] for k in ("model", "instructions", "input")})
+                count.raise_for_status()
+                tokens = count.json().get("input_tokens")
+                if type(tokens) is not int or tokens < 0 or tokens > max_input_tokens:
+                    raise ValueError("Input count unavailable or exceeds approved cap")
             response = client.post(
                 "https://api.openai.com/v1/responses",
                 headers={
@@ -528,12 +559,15 @@ def call_openai_responses_api(payload: dict) -> dict:
     data = response.json()
     usage = data.get("usage", {})
 
+    metadata = response_metadata(data, payload["model"])
+    if payload["model"] == "gpt-6-luna" and metadata["usage_status"] == "known":
+        if metadata["input_tokens"] > max_input_tokens or metadata["output_tokens"] > payload["max_output_tokens"]:
+            raise ValueError("Provider usage exceeded admitted token caps")
     return {
+        **metadata,
         "raw": extract_openai_response_text(data),
         "search_queries": extract_openai_search_queries(data),
-        "input_tokens": usage.get("input_tokens", 0),
-        "output_tokens": usage.get("output_tokens", 0),
-        "model_version": data.get("model", payload.get("model", "")),
+
     }
 
 
@@ -777,48 +811,32 @@ def call_claude(row: dict, condition: str, pdf_path: str | Path = None, model_na
     }
 
 
-def call_gpt(row: dict, condition: str, pdf_path: str | Path = None, model_name: str = "gpt") -> dict:
-    uses_pdf = condition in {"pdf", "pdf_websearch", "pdf_structure"}
-    uses_websearch = condition in {"websearch", "pdf_websearch"}
-
-    if uses_pdf and pdf_path:
-        input_value = [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "input_file",
-                        "filename": Path(pdf_path).name,
-                        "file_data": f"data:application/pdf;base64,{get_pdf_base64(pdf_path)}",
-                    },
-                    {
-                        "type": "input_text",
-                        "text": build_user_prompt(row),
-                    },
-                ],
-            }
-        ]
+def call_gpt(row: dict, condition: str, pdf_path: str | Path = None, model_name: str = "gpt", reasoning_config: ReasoningConfig | None = None) -> dict:
+    config = reasoning_config or ReasoningConfig(max_output_tokens=MAX_RESPONSE_TOKENS)
+    payload = build_request(
+        model=resolve_model_name(model_name), instructions=get_system_prompt(row, condition),
+        user_prompt=build_user_prompt(row), condition=condition, config=config,
+        guideline_text=get_pdf_text(pdf_path) if condition.startswith("text_md") and pdf_path else None,
+        pdf_data=get_pdf_base64(pdf_path) if condition.startswith("pdf") and pdf_path else None,
+        pdf_name=Path(pdf_path).name if pdf_path else None)
+    # Luna never uses implicit transport retries: an uncertain request may be billed.
+    if payload["model"] == "gpt-6-luna":
+        started = time.monotonic()
+        response = call_openai_responses_api(payload, config.max_input_tokens)
+        retry_metrics = {"api_latency": time.monotonic() - started,
+                         "total_latency": time.monotonic() - started,
+                         "retry_sleep_seconds": 0, "attempt_count": 1}
     else:
-        input_value = build_user_prompt(row)
-
-    payload = {
-        "model": resolve_model_name(model_name, condition),
-        "instructions": get_system_prompt(row, condition),
-        "input": input_value,
-        "max_output_tokens": MAX_RESPONSE_TOKENS,
-    }
-    if uses_websearch:
-        payload["tools"] = [{"type": "web_search"}]
-
-    response, retry_metrics = with_retries(
-        f"{resolve_model_name(model_name)}|{condition}",
-        lambda: call_openai_responses_api(payload),
-    )
+        response, retry_metrics = with_retries(
+            f"{resolve_model_name(model_name)}|{condition}",
+            lambda: call_openai_responses_api(payload),
+        )
 
     answer = response["raw"].strip()
     parsed_output = parse_model_output(answer)
 
     return {
+        **{k: response.get(k) for k in ("response_id", "response_status", "usage_status", "usage_details")},
         "raw": parsed_output["normalized_raw"],
         "parsed": parsed_output["decision"],
         "reason": parsed_output["reason"],
@@ -1019,12 +1037,22 @@ def run_evaluation(
     task_plan: pd.DataFrame | None = None,
     incremental_csv_path: str | Path | None = None,
     n_runs: int = 1,
+    reasoning_config: ReasoningConfig | None = None,
+    experiment_id: str | None = None,
+    max_run_calls: int = 6,
 ) -> pd.DataFrame:
     """
     Run the full evaluation.
     dry_run=True: validate structure without real API calls
     """
+    if type(n_runs) is not int or n_runs < 1:
+        raise ValueError("n_runs must be positive")
+    experiment_id = experiment_id or uuid.uuid4().hex
+    reasoning_config = reasoning_config or ReasoningConfig(max_output_tokens=MAX_RESPONSE_TOKENS)
     models = models or ["claude", "gpt", "gemini"]
+    for model in models:
+        if resolve_model_provider(model) == "gpt":
+            reasoning_config.validate(resolve_model_name(model))
     conditions = conditions or CONDITIONS
 
     for cancer, path in PDF_PATHS.items():
@@ -1056,6 +1084,9 @@ def run_evaluation(
             for _, task in task_plan.iterrows()
         ]
 
+    if any(resolve_model_name(m) == "gpt-6-luna" for m in models):
+        if type(max_run_calls) is not int or max_run_calls < 1 or len(task_records) > max_run_calls:
+            raise ValueError("Planned classification calls exceed explicit run cap")
     results = []
     total = len(task_records)
     count = 0
@@ -1068,6 +1099,19 @@ def run_evaluation(
         condition = task["condition"]
         run_id = task.get("run_id", 0)
 
+        input_hash = request_hash({"prompt": build_user_prompt(row),
+            "instructions": get_system_prompt(row, condition), "condition": condition,
+            "max_output_tokens": reasoning_config.max_output_tokens,
+            "max_input_tokens": reasoning_config.max_input_tokens, "dry_run": dry_run,
+            "guideline_sha256": hashlib.sha256(Path(pdf_path).read_bytes()).hexdigest()
+                if condition in PDF_REQUIRED_CONDITIONS and pdf_path else None})
+        effort = reasoning_config.effort if resolve_model_name(model_name) == "gpt-6-luna" else None
+        mode = reasoning_config.mode if effort else "standard"
+        eid = episode_id(case_id=row["ID"], model=resolve_model_name(model_name),
+            condition=condition, run_id=int(run_id), effort=effort, mode=mode,
+            experiment_id=experiment_id, input_hash=input_hash)
+        if task_plan is not None and eid != row["episode_id"]:
+            raise ValueError("Retry source/config/input identity differs from original episode")
         count += 1
         print(f"[{count}/{total}] {model_name} | {condition} | {row['ID']}", end=" ")
 
@@ -1091,7 +1135,10 @@ def run_evaluation(
                 provider = resolve_model_provider(model_name)
                 fn = MODEL_CALLERS[provider]
                 selected_pdf_path = pdf_path if condition in PDF_REQUIRED_CONDITIONS else None
-                result = fn(row, condition, selected_pdf_path, model_name=model_name)
+                kwargs = {"model_name": model_name}
+                if provider == "gpt":
+                    kwargs["reasoning_config"] = reasoning_config
+                result = fn(row, condition, selected_pdf_path, **kwargs)
 
                 time.sleep(delay)
             except Exception as e:
@@ -1104,14 +1151,20 @@ def run_evaluation(
                     "total_latency": float(getattr(e, "_retry_metrics", {}).get("total_latency", 0.0)),
                     "retry_sleep_seconds": float(getattr(e, "_retry_metrics", {}).get("retry_sleep_seconds", 0.0)),
                     "attempt_count": int(getattr(e, "_retry_metrics", {}).get("attempt_count", 0)),
-                    "input_tokens": 0,
-                    "output_tokens": 0,
+                    "input_tokens": None,
+                    "output_tokens": None,
+                    "usage_status": "unknown",
                 }
 
         correct = result["parsed"] == row["expected"]
         print(f"→ {result['parsed']} ({'✓' if correct else '✗'})")
 
         result_row = {
+            "episode_id": eid, "attempt_id": uuid.uuid4().hex,
+            "experiment_id": experiment_id, "input_hash": input_hash,
+            "reasoning_effort": effort, "reasoning_mode": mode,
+            "is_dry_run": dry_run,
+            **{k: result.get(k) for k in ("response_id", "response_status", "usage_status", "usage_details")},
             "id": row["ID"],
             "cancer_type": cancer,
             "class": row["class"],
@@ -1120,7 +1173,7 @@ def run_evaluation(
             "expected": row["expected"],
             "model": model_name,
             "model_provider": resolve_model_provider(model_name),
-            "model_version": result.get("model_version", resolve_model_name(model_name, condition)),
+            "model_version": result.get("model_version"),
             "generation_settings_policy": GENERATION_SETTINGS_POLICY,
             "condition": condition,
             "run_id": run_id,
@@ -1181,7 +1234,23 @@ if __name__ == "__main__":
         "--n-runs", type=int, default=1,
         help="Number of repeated runs (default 1). 3-5 recommended for mean/SD/CI estimation",
     )
+    parser.add_argument("--case-id", action="append", help="Exact fixture ID; repeat for a bounded set")
+    parser.add_argument("--reasoning-effort", choices=["medium", "max"])
+    parser.add_argument("--reasoning-mode", choices=["standard", "pro"], default="standard")
+    parser.add_argument("--max-output-tokens", type=int, default=4096)
+    parser.add_argument("--max-input-tokens", type=int, default=100000)
+    parser.add_argument("--max-run-calls", type=int, default=6)
+    parser.add_argument("--experiment-id", default=None)
+    parser.add_argument("--output-dir", type=Path, default=OUTPUT_DIR)
+    parser.add_argument("--load-env", action="store_true", help="Explicitly opt into local dotenv files")
     args = parser.parse_args()
+    if args.load_env:
+        load_local_env()
+        ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+        OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+        GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+    config = ReasoningConfig(args.reasoning_effort, args.reasoning_mode, args.max_output_tokens, args.max_input_tokens)
+    experiment = args.experiment_id or uuid.uuid4().hex
 
     # Load data
     df = load_benchmark(EXCEL_PATH)
@@ -1191,12 +1260,20 @@ if __name__ == "__main__":
         df = df[df["cancer_type"].isin(args.cancer)]
         print(f"Filter applied: {args.cancer} -> {len(df)} cases")
 
+    ids = selected_ids(df["ID"].tolist(), args.case_id)
+    df = df[df["ID"].isin(ids)]
+    if df.empty:
+        raise ValueError("No selected cases")
     validate_runtime(args.models, args.dry_run)
 
     previous_results_df = None
     retry_task_plan = None
     if args.retry_errors_from:
         previous_results_df = load_saved_results(args.retry_errors_from)
+        experiments = previous_results_df["experiment_id"].dropna().unique()
+        if len(experiments) != 1 or (args.experiment_id and args.experiment_id != experiments[0]):
+            raise ValueError("Retry requires one matching original experiment")
+        experiment = experiments[0]
         retry_task_plan = build_retry_task_plan(
             benchmark_df=df,
             previous_results=previous_results_df,
@@ -1212,9 +1289,10 @@ if __name__ == "__main__":
             print("No error items to re-run.")
             raise SystemExit(0)
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     run_label = "knhib_results_retry" if previous_results_df is not None else "knhib_results"
-    out_path = OUTPUT_DIR / f"{run_label}_{timestamp}.csv"
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    out_path = args.output_dir / f"{run_label}_{timestamp}.csv"
     print(f"Intermediate save: {out_path}")
 
     # Run evaluation
@@ -1227,6 +1305,9 @@ if __name__ == "__main__":
         task_plan=retry_task_plan,
         incremental_csv_path=out_path,
         n_runs=args.n_runs,
+        reasoning_config=config,
+        experiment_id=experiment,
+        max_run_calls=args.max_run_calls,
     )
 
     results_df = (
