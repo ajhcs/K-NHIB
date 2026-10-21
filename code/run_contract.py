@@ -61,35 +61,74 @@ def request_hash(payload):
                                      separators=(",", ":")).encode()).hexdigest()
 
 
-def episode_id(*, case_id, model, condition, run_id, effort, mode, experiment_id, input_hash):
+def episode_id(*, case_id, model, condition, run_id, effort, mode, experiment_id, input_hash, gold_hash=""):
+    """Gold provenance affects scoring identity but is never part of model input."""
     if not experiment_id or type(run_id) is not int or run_id < 0:
         raise ValueError("Explicit experiment ID and nonnegative replicate required")
     return request_hash(dict(case_id=case_id, model=model, condition=condition,
                              run_id=run_id, effort=effort, mode=mode,
-                             experiment_id=experiment_id, input_hash=input_hash))
+                             experiment_id=experiment_id, input_hash=input_hash, gold_hash=gold_hash))
+
+
+class ResponseContractError(ValueError):
+    def __init__(self, reason, metadata):
+        super().__init__(reason)
+        self.metadata = metadata
 
 
 def response_metadata(data, requested_model):
-    """Incomplete/refused/substituted responses are never ordinary scored answers."""
-    if data.get("model") != requested_model and requested_model == LUNA:
-        raise ValueError("Returned model differs from exact requested Luna")
-    if data.get("status") != "completed":
-        raise ValueError("Responses request did not complete")
-    for item in data.get("output", []):
-        for content in item.get("content", []):
-            if content.get("type") == "refusal":
-                raise ValueError("Model refused request")
+    """Preserve billed telemetry before classifying failed/incomplete responses."""
     usage = data.get("usage")
     usage = usage if isinstance(usage, dict) else {}
-    fields = [usage.get("input_tokens"), usage.get("output_tokens")]
-    known = all(type(x) is int and x >= 0 for x in fields)
-    return {"response_id": data.get("id"), "response_status": data.get("status"),
-            "model_version": data.get("model"),
-            "input_tokens": fields[0] if known else None,
-            "output_tokens": fields[1] if known else None,
-            "usage_status": "known" if known else "unknown",
-            "usage_details": usage,
-            "incomplete_details": data.get("incomplete_details")}
+    values = [usage.get("input_tokens"), usage.get("output_tokens")]
+    known = all(type(x) is int and x >= 0 for x in values)
+    metadata = {"response_id": data.get("id"), "response_status": data.get("status"),
+                "model_version": data.get("model"),
+                "input_tokens": values[0] if known else None,
+                "output_tokens": values[1] if known else None,
+                "usage_status": "known" if known else "unknown", "usage_details": usage,
+                "incomplete_details": data.get("incomplete_details"),
+                "response_receipt": data}
+    reason = None
+    if requested_model == LUNA and data.get("model") != requested_model:
+        reason = "Returned model differs from exact requested Luna"
+    elif data.get("status") != "completed":
+        reason = "Responses request did not complete"
+    elif any(c.get("type") == "refusal" for item in data.get("output", [])
+             for c in item.get("content", [])):
+        reason = "Model refused request"
+    if reason:
+        raise ResponseContractError(reason, metadata)
+    return metadata
+
+
+def reconcile_plan(plan, observed):
+    """One final outcome per planned episode; absent attempts remain explicit failures."""
+    expected = {}
+    for row in plan:
+        eid = row["episode_id"]
+        if eid in expected and expected[eid] != row:
+            raise ValueError("Conflicting planned episode")
+        expected[eid] = row
+    if not expected:
+        raise ValueError("No immutable planned episodes")
+    found = {}
+    for row in observed:
+        eid = row["episode_id"]
+        if eid not in expected:
+            raise ValueError("Observed episode absent from immutable plan")
+        for key in ("id", "model", "condition", "run_id", "reasoning_effort", "reasoning_mode",
+                    "experiment_id", "input_hash", "configuration_id", "fixture_hash", "gold_hash", "expected", "is_dry_run"):
+            value = row.get(key)
+            # CSV empty effort is normalized by caller; all other fields must agree.
+            if value != expected[eid].get(key):
+                raise ValueError("Observed episode identity/gold differs from plan: " + key)
+        found[eid] = row
+    return [found.get(eid, dict(row, attempt_id="missing:" + eid,
+                timestamp=row["planned_at"], predicted="missing", correct=False,
+                usage_status="unknown", input_tokens=None, output_tokens=None,
+                response_status="not_observed", response_id=None))
+            for eid, row in expected.items()]
 
 
 def selected_ids(available, requested):

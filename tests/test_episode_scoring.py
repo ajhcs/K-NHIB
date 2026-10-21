@@ -2,6 +2,8 @@
 import importlib.util
 from pathlib import Path
 import unittest
+import sys
+sys.path.insert(0, str(Path(__file__).parents[1] / "code"))
 import pandas as pd
 
 SPEC = importlib.util.spec_from_file_location("knhib_scoring", Path(__file__).parents[1] / "code/aggregate_results.py")
@@ -12,7 +14,7 @@ SPEC.loader.exec_module(scorer)
 class EpisodeScoring(unittest.TestCase):
     def row(self, **kw):
         d = dict(episode_id="e1", attempt_id="a1", experiment_id="invented", run_id=0,
-                 reasoning_effort="medium", reasoning_mode="standard", input_hash="fixture", is_dry_run=False,
+                 reasoning_effort="medium", reasoning_mode="standard", input_hash="fixture", configuration_id="config", fixture_hash="synthetic-fixture", gold_hash="synthetic-gold", is_dry_run=False,
                  timestamp="2026-10-20T00:00:00Z", predicted="error", expected="eligible")
         d.update(kw)
         return d

@@ -20,7 +20,7 @@ import unicodedata
 import hashlib
 import uuid
 from run_contract import (ReasoningConfig, build_request, episode_id,
-                          request_hash, response_metadata, selected_ids)
+                          request_hash, response_metadata, selected_ids, ResponseContractError)
 from datetime import datetime
 from pathlib import Path
 
@@ -155,9 +155,9 @@ GEMINI_HTTP_TIMEOUT_MS = int(os.environ.get("GEMINI_HTTP_TIMEOUT_MS", "300000"))
 GENERATION_SETTINGS_POLICY = "provider_defaults"
 RESULT_KEY_COLUMNS = ["episode_id", "attempt_id"]
 RESULT_COLUMNS = [
-    "episode_id", "attempt_id", "experiment_id", "input_hash",
+    "episode_id", "attempt_id", "experiment_id", "input_hash", "configuration_id", "fixture_hash", "gold_hash",
     "reasoning_effort", "reasoning_mode", "is_dry_run",
-    "response_id", "response_status", "usage_status", "usage_details",
+    "response_id", "response_status", "usage_status", "usage_details", "response_receipt", "incomplete_details",
     "id",
     "cancer_type",
     "class",
@@ -231,9 +231,10 @@ def build_retry_task_plan(
     previous_results: pd.DataFrame,
     models: list[str],
     conditions: list[str],
+    reasoning_config: ReasoningConfig | None = None,
 ) -> pd.DataFrame:
     required_columns = {"id", "model", "condition", "predicted", "run_id",
-                        "episode_id", "reasoning_effort", "reasoning_mode", "experiment_id", "input_hash"}
+                        "episode_id", "reasoning_effort", "reasoning_mode", "experiment_id", "input_hash", "gold_hash", "fixture_hash"}
     missing_columns = required_columns - set(previous_results.columns)
     if missing_columns:
         raise ValueError(
@@ -244,6 +245,9 @@ def build_retry_task_plan(
     latest = previous_results.sort_values("timestamp", kind="stable").drop_duplicates(subset=["episode_id"], keep="last")
     failed = latest[latest["predicted"].astype(str) == "error"].copy()
     failed = failed[failed["model"].isin(models) & failed["condition"].isin(conditions)]
+    config = reasoning_config or ReasoningConfig()
+    failed = failed[failed["reasoning_effort"].fillna("provider_default").eq(config.effort or "provider_default")
+                    & failed["reasoning_mode"].eq(config.mode)]
     failed = failed.drop_duplicates(subset=["episode_id"])
 
     benchmark_rows = benchmark_df.copy()
@@ -321,11 +325,7 @@ def get_pdf_text(pdf_path: str | Path) -> str:
     if pdf_path not in _pdf_text_cache:
         text = load_pdf_text(pdf_path)
         _pdf_text_cache[pdf_path] = text
-        # Persist the parsed text as a reproducible artifact (under results/, gitignored).
-        # Source guideline PDFs ship with the repo; parsed text is generated on run.
-        parsed_dir = OUTPUT_DIR / "parsed_guidelines"
-        parsed_dir.mkdir(parents=True, exist_ok=True)
-        (parsed_dir / f"{Path(pdf_path).stem}.txt").write_text(text, encoding="utf-8")
+        # Parsing stays in memory; generated artifacts use only the selected output root.
     return _pdf_text_cache[pdf_path]
 
 
@@ -836,7 +836,7 @@ def call_gpt(row: dict, condition: str, pdf_path: str | Path = None, model_name:
     parsed_output = parse_model_output(answer)
 
     return {
-        **{k: response.get(k) for k in ("response_id", "response_status", "usage_status", "usage_details")},
+        **{k: response.get(k) for k in ("response_id", "response_status", "usage_status", "usage_details", "response_receipt", "incomplete_details")},
         "raw": parsed_output["normalized_raw"],
         "parsed": parsed_output["decision"],
         "reason": parsed_output["reason"],
@@ -1028,6 +1028,22 @@ CONDITIONS = ["websearch", "pdf", "pdf_websearch", "text_md", "text_md_websearch
 PDF_REQUIRED_CONDITIONS = {"pdf", "pdf_websearch", "text_md", "text_md_websearch", "pdf_structure"}
 
 
+def persist_receipt(path: Path, payload: dict) -> None:
+    """Atomic, fsynced receipt before transport and after terminal result."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    with tmp.open("x", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+    directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
 def run_evaluation(
     df: pd.DataFrame,
     models: list = None,
@@ -1040,6 +1056,7 @@ def run_evaluation(
     reasoning_config: ReasoningConfig | None = None,
     experiment_id: str | None = None,
     max_run_calls: int = 6,
+    output_dir: Path = OUTPUT_DIR,
 ) -> pd.DataFrame:
     """
     Run the full evaluation.
@@ -1087,6 +1104,65 @@ def run_evaluation(
     if any(resolve_model_name(m) == "gpt-6-luna" for m in models):
         if type(max_run_calls) is not int or max_run_calls < 1 or len(task_records) > max_run_calls:
             raise ValueError("Planned classification calls exceed explicit run cap")
+    fixture_hash = request_hash({"workbook":hashlib.sha256(EXCEL_PATH.read_bytes()).hexdigest(),
+        "guidelines":{name:hashlib.sha256(path.read_bytes()).hexdigest() for name,path in sorted(PDF_PATHS.items())}})
+    configuration_id = request_hash({"reasoning": vars(reasoning_config), "fixture_hash":fixture_hash,
+        "source": {name: hashlib.sha256((BASE_DIR/name).read_bytes()).hexdigest()
+                   for name in ("benchmark_pipeline.py", "run_contract.py")}})
+    planned_at = datetime.now().isoformat()
+    planned = []
+    for task in task_records:
+        row = task["row"]
+        cancer = row["cancer_type"]
+        pdf_path = PDF_PATHS.get(cancer)
+        model_name, condition, run_id = task["model_name"], task["condition"], task["run_id"]
+        input_hash = request_hash({"prompt": build_user_prompt(row),
+            "instructions": get_system_prompt(row, condition), "condition": condition,
+            "max_output_tokens": reasoning_config.max_output_tokens,
+            "max_input_tokens": reasoning_config.max_input_tokens, "dry_run": dry_run,
+            "configuration_id": configuration_id,
+            "guideline_sha256": hashlib.sha256(Path(pdf_path).read_bytes()).hexdigest()
+                if condition in PDF_REQUIRED_CONDITIONS and pdf_path else None})
+        effort = reasoning_config.effort if resolve_model_name(model_name) == "gpt-6-luna" else None
+        mode = reasoning_config.mode if effort else "standard"
+        gold_hash = request_hash({"id":row["ID"], "expected":row["expected"], "class":row["class"]})
+        if task_plan is not None and (row["gold_hash"] != gold_hash or row["fixture_hash"] != fixture_hash):
+            raise ValueError("Retry fixture/gold provenance differs from original episode")
+        eid = episode_id(case_id=row["ID"], model=resolve_model_name(model_name),
+            condition=condition, run_id=int(run_id), effort=effort, mode=mode,
+            experiment_id=experiment_id, input_hash=input_hash, gold_hash=gold_hash)
+        if task_plan is not None and eid != row["episode_id"]:
+            raise ValueError("Retry source/config/input identity differs from original episode")
+        task["identity"] = {"episode_id": eid, "input_hash": input_hash,
+            "reasoning_effort": effort, "reasoning_mode": mode, "configuration_id": configuration_id,
+            "fixture_hash":fixture_hash, "gold_hash":gold_hash}
+        planned.append(dict(task["identity"], id=row["ID"], model=model_name,
+            condition=condition, run_id=int(run_id), experiment_id=experiment_id,
+            expected=row["expected"], cancer_type=cancer, **{"class":row["class"]},
+            is_dry_run=dry_run, planned_at=planned_at))
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    plan_name = request_hash(planned)
+    plan_path = output_dir / ("knhib_plan_" + plan_name + ".json")
+    if task_plan is not None:
+        existing_plans = [json.loads(p.read_text()) for p in output_dir.glob("knhib_plan_*.json")]
+        existing_ids = {e["episode_id"] for p in existing_plans for e in p["episodes"]}
+        if not {e["episode_id"] for e in planned} <= existing_ids:
+            raise ValueError("Retry output root lacks the original selected plan")
+    elif not plan_path.exists():
+        with plan_path.open("x", encoding="utf-8") as handle:
+            json.dump({"schema":"knhib-plan-v1", "sha256":plan_name, "episodes":planned}, handle,
+                      ensure_ascii=False, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        directory = os.open(output_dir, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    elif json.loads(plan_path.read_text())["episodes"] != planned:
+        raise ValueError("Plan filename collision")
+
     results = []
     total = len(task_records)
     count = 0
@@ -1099,22 +1175,18 @@ def run_evaluation(
         condition = task["condition"]
         run_id = task.get("run_id", 0)
 
-        input_hash = request_hash({"prompt": build_user_prompt(row),
-            "instructions": get_system_prompt(row, condition), "condition": condition,
-            "max_output_tokens": reasoning_config.max_output_tokens,
-            "max_input_tokens": reasoning_config.max_input_tokens, "dry_run": dry_run,
-            "guideline_sha256": hashlib.sha256(Path(pdf_path).read_bytes()).hexdigest()
-                if condition in PDF_REQUIRED_CONDITIONS and pdf_path else None})
-        effort = reasoning_config.effort if resolve_model_name(model_name) == "gpt-6-luna" else None
-        mode = reasoning_config.mode if effort else "standard"
-        eid = episode_id(case_id=row["ID"], model=resolve_model_name(model_name),
-            condition=condition, run_id=int(run_id), effort=effort, mode=mode,
-            experiment_id=experiment_id, input_hash=input_hash)
-        if task_plan is not None and eid != row["episode_id"]:
-            raise ValueError("Retry source/config/input identity differs from original episode")
+        input_hash = task["identity"]["input_hash"]
+        effort = task["identity"]["reasoning_effort"]
+        mode = task["identity"]["reasoning_mode"]
+        eid = task["identity"]["episode_id"]
         count += 1
         print(f"[{count}/{total}] {model_name} | {condition} | {row['ID']}", end=" ")
 
+        attempt = uuid.uuid4().hex
+        receipt_path = output_dir / "requests" / (attempt + ".json")
+        persist_receipt(receipt_path, {"episode_id":eid, "attempt_id":attempt,
+            "status":"not_sent_placeholder" if dry_run else "pending_usage_unknown",
+            "usage_status":"unknown", "configuration_id":configuration_id})
         if dry_run:
             dry_predicted = (
                 "eligible"
@@ -1155,16 +1227,20 @@ def run_evaluation(
                     "output_tokens": None,
                     "usage_status": "unknown",
                 }
+                if isinstance(e, ResponseContractError):
+                    result.update(e.metadata)
 
         correct = result["parsed"] == row["expected"]
         print(f"→ {result['parsed']} ({'✓' if correct else '✗'})")
 
         result_row = {
-            "episode_id": eid, "attempt_id": uuid.uuid4().hex,
+            "episode_id": eid, "attempt_id": attempt,
+            "configuration_id": configuration_id,
+            "fixture_hash":task["identity"]["fixture_hash"], "gold_hash":task["identity"]["gold_hash"],
             "experiment_id": experiment_id, "input_hash": input_hash,
             "reasoning_effort": effort, "reasoning_mode": mode,
             "is_dry_run": dry_run,
-            **{k: result.get(k) for k in ("response_id", "response_status", "usage_status", "usage_details")},
+            **{k: result.get(k) for k in ("response_id", "response_status", "usage_status", "usage_details", "response_receipt", "incomplete_details")},
             "id": row["ID"],
             "cancer_type": cancer,
             "class": row["class"],
@@ -1176,7 +1252,7 @@ def run_evaluation(
             "model_version": result.get("model_version"),
             "generation_settings_policy": GENERATION_SETTINGS_POLICY,
             "condition": condition,
-            "run_id": run_id,
+            "run_id": int(run_id),
             "predicted": result["parsed"],
             "reason": result.get("reason", ""),
             "correct": correct,
@@ -1190,6 +1266,7 @@ def run_evaluation(
             "output_tokens": result["output_tokens"],
             "timestamp": datetime.now().isoformat(),
         }
+        persist_receipt(receipt_path, dict(result_row, status="terminal"))
         results.append(result_row)
         if incremental_csv_path is not None:
             append_result_csv_row(incremental_csv_path, result_row)
@@ -1279,6 +1356,7 @@ if __name__ == "__main__":
             previous_results=previous_results_df,
             models=args.models,
             conditions=args.conditions,
+            reasoning_config=config,
         )
         print(
             "Re-run targets: "
@@ -1308,6 +1386,7 @@ if __name__ == "__main__":
         reasoning_config=config,
         experiment_id=experiment,
         max_run_calls=args.max_run_calls,
+        output_dir=args.output_dir,
     )
 
     results_df = (
@@ -1322,7 +1401,7 @@ if __name__ == "__main__":
 
     # Also save raw results as Excel. Scoring/metrics are produced by aggregate_results.py.
     if not args.dry_run:
-        excel_path = OUTPUT_DIR / f"{run_label}_{timestamp}.xlsx"
+        excel_path = args.output_dir / f"{run_label}_{timestamp}.xlsx"
         with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
             results_df.to_excel(writer, sheet_name="raw", index=False)
         print(f"Excel saved: {excel_path}")

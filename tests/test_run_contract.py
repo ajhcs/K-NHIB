@@ -74,5 +74,24 @@ class RequestContracts(unittest.TestCase):
                 contract.selected_ids(["S-1"], requested)
 
 
+class FailureAndCoverageContracts(unittest.TestCase):
+    def test_incomplete_and_refusal_keep_billed_usage(self):
+        for extra in ({"status":"incomplete"}, {"status":"completed", "output":[{"content":[{"type":"refusal"}]}]}):
+            data = dict(model="gpt-6-luna", id="synthetic-response", usage={"input_tokens":10,"output_tokens":20}, **extra)
+            with self.assertRaises(contract.ResponseContractError) as caught:
+                contract.response_metadata(data, "gpt-6-luna")
+            self.assertEqual(caught.exception.metadata["output_tokens"], 20)
+            self.assertEqual(caught.exception.metadata["response_id"], "synthetic-response")
+
+    def test_interrupted_plan_does_not_shrink_denominator(self):
+        plan = [dict(episode_id="e1", planned_at="2026-10-20T00:00:00", id="invented", model="gpt-6-luna",
+                     condition="text_md", run_id=0, reasoning_effort="medium", reasoning_mode="standard",
+                     experiment_id="offline", input_hash="h", configuration_id="config", expected="eligible", is_dry_run=False)]
+        reconciled = contract.reconcile_plan(plan, [])
+        self.assertEqual(len(reconciled), 1)
+        self.assertEqual(reconciled[0]["predicted"], "missing")
+        self.assertFalse(reconciled[0]["correct"])
+
+
 if __name__ == "__main__":
     unittest.main()

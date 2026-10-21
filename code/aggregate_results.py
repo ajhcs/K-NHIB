@@ -15,6 +15,8 @@ Output: results/aggregated/
 from __future__ import annotations
 
 import glob
+import json
+from run_contract import reconcile_plan, request_hash
 from pathlib import Path
 
 import numpy as np
@@ -47,14 +49,14 @@ def load_all() -> pd.DataFrame:
         d["_source_file"] = Path(f).name
         dfs.append(d)
     if not dfs:
-        raise ValueError(f"No benchmark result CSV files in {RESULTS_DIR}")
+        return pd.DataFrame()
     return pd.concat(dfs, ignore_index=True, sort=False)
 
 
 def deduplicate(df: pd.DataFrame) -> pd.DataFrame:
     """Keep latest attempt per explicit episode, never collapse efforts or replicates."""
     required = {"episode_id", "attempt_id", "experiment_id", "run_id", "reasoning_effort",
-                "reasoning_mode", "input_hash", "is_dry_run", "timestamp"}
+                "reasoning_mode", "input_hash", "configuration_id", "fixture_hash", "gold_hash", "is_dry_run", "timestamp"}
     if required - set(df.columns):
         raise ValueError("Legacy results lack explicit episode/config identity; migrate explicitly")
     if df.empty or df[list(required - {"reasoning_effort"})].isna().any().any():
@@ -113,7 +115,18 @@ def main() -> None:
 
     raw.to_csv(OUT_DIR / "all_attempts.csv", index=False)
     print("Selecting final attempts by immutable episode ID (all attempts retained)...")
-    master = deduplicate(raw)
+    manifests = [json.loads(p.read_text()) for p in sorted(RESULTS_DIR.glob("knhib_plan_*.json"))]
+    plan = []
+    for manifest in manifests:
+        if manifest.get("schema") != "knhib-plan-v1" or request_hash(manifest["episodes"]) != manifest.get("sha256"):
+            raise ValueError("Plan manifest hash/schema mismatch")
+        plan.extend(manifest["episodes"])
+    final = deduplicate(raw).to_dict("records") if not raw.empty else []
+    for row in final:
+        if pd.isna(row.get("reasoning_effort")):
+            row["reasoning_effort"] = None
+    master = pd.DataFrame(reconcile_plan(plan, final))
+    print(f"Missing planned episodes: {(master['predicted'] == 'missing').sum()}")
     print(f"  unique rows: {len(master):,}")
 
     # Group by requested model/config/experiment, including failed calls and every replicate.
@@ -123,7 +136,8 @@ def main() -> None:
     master["is_main_analysis"] = dry.eq("false")
     master["model_canonical"] = (master["model"].astype(str) + "|" +
         master["reasoning_effort"].fillna("provider_default").astype(str) + "|" +
-        master["reasoning_mode"].astype(str) + "|" + master["experiment_id"].astype(str))
+        master["reasoning_mode"].astype(str) + "|" + master["experiment_id"].astype(str) + "|" +
+        master["configuration_id"].astype(str))
     master.to_csv(OUT_DIR / "master_dataset.csv", index=False)
     main_df = master[master["is_main_analysis"]].copy()
     if main_df.empty:

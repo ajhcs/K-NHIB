@@ -42,3 +42,16 @@ scratch and retain outputs. No locked dependency environment is implied by this 
 Official contract references: [Luna](https://developers.openai.com/api/docs/models/gpt-6-luna),
 [reasoning](https://developers.openai.com/api/docs/guides/reasoning),
 [count input tokens](https://developers.openai.com/api/docs/guides/token-counting).
+
+Review corrections: all output, including Excel and durable request receipts, uses the
+selected output root; parsed guideline text is kept in memory. Failure receipts retain
+available returned ID/status/model/usage even for incomplete or refused Responses. A
+hash-identified immutable selected plan is fsynced before transport; the scorer reconciles
+it against observations and includes missing episodes in the denominator. Configuration
+hashes separate source/budget changes. Pending attempt receipts are atomically persisted
+and fsynced before the model call; external termination leaves usage explicitly unknown.
+These are source changes with prepared coverage tests, not executed verification.
+Mixed-arm retries select exact effort/mode first and validate every episode identity before
+any external request. A fixture/gold digest is separate from model-visible input; gold-only
+changes cannot reuse scoring identity. The source/budget/dataset configuration digest is
+part of scorer grouping, so changed guideline/cap/source variants cannot silently pool.
